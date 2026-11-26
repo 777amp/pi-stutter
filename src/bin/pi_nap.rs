@@ -117,7 +117,10 @@ fn main() -> Result<()> {
                 let step = daemon.poll_interval();
                 let mut slept = Duration::ZERO;
                 while slept < step && !stop.load(Ordering::Relaxed) {
-                    let chunk = Duration::from_millis(100).min(step - slept);
+                    if daemon.take_focus_changed() {
+                        break;
+                    }
+                    let chunk = Duration::from_millis(25).min(step - slept);
                     std::thread::sleep(chunk);
                     slept += chunk;
                 }

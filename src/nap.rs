@@ -943,12 +943,52 @@ pub fn app_names_match(a: &str, b: &str) -> bool {
     if !sa.is_empty() && sa == sb {
         return true;
     }
-    // Handle 15-character /proc/<pid>/comm truncation (e.g. "chromium-browse" vs "chromium-browser")
+    // Substring match on stems (e.g., "chromium" vs "chromium-browser", "chrome-xyz", "code-url-handler")
+    if sa.len() >= 4 && (nb.contains(&sa) || sb.contains(&sa)) {
+        return true;
+    }
+    if sb.len() >= 4 && (na.contains(&sb) || sa.contains(&sb)) {
+        return true;
+    }
+    // Handle 15-character /proc/<pid>/comm truncation
     if na.len() == 15 && nb.starts_with(&na) {
         return true;
     }
     if nb.len() == 15 && na.starts_with(&nb) {
         return true;
+    }
+    false
+}
+
+/// Checks if a Wayland window (app_id + title) belongs to `app` (or its `.desktop` display name).
+fn wayland_window_matches(
+    app: &str,
+    display_name: Option<&str>,
+    focused_app_id: Option<&str>,
+    focused_title: Option<&str>,
+) -> bool {
+    if let Some(aid) = focused_app_id {
+        if app_names_match(aid, app) {
+            return true;
+        }
+        if let Some(dn) = display_name {
+            if app_names_match(aid, dn) {
+                return true;
+            }
+        }
+    }
+    if let Some(title) = focused_title {
+        let tl = title.to_lowercase();
+        let stem = app_stem(app);
+        if stem.len() >= 4 && tl.contains(&stem) {
+            return true;
+        }
+        if let Some(dn) = display_name {
+            let dl = dn.to_lowercase();
+            if dl.len() >= 4 && tl.contains(&dl) {
+                return true;
+            }
+        }
     }
     false
 }
@@ -959,6 +999,7 @@ pub struct NapDaemon {
     cfg_mtime: Option<SystemTime>,
     my_uid: u32,
     my_ancestors: HashSet<i32>,
+    installed_apps: HashMap<String, (String, String)>,
     wl_watcher: crate::wayland_focus::WaylandFocusWatcher,
     /// Tracks when each enabled app was last seen unfocused.
     unfocused_since: HashMap<String, Instant>,
@@ -975,6 +1016,7 @@ impl NapDaemon {
         let my_ancestors = ancestor_and_self_set(my_pid, &procs);
         let cfg = NapConfig::load();
         let cfg_mtime = fs::metadata(config_path()).and_then(|m| m.modified()).ok();
+        let installed_apps = discover_installed_apps();
         let wl_watcher = crate::wayland_focus::WaylandFocusWatcher::start();
 
         Self {
@@ -982,6 +1024,7 @@ impl NapDaemon {
             cfg_mtime,
             my_uid: current_uid(),
             my_ancestors,
+            installed_apps,
             wl_watcher,
             unfocused_since: HashMap::new(),
             frozen_apps: BTreeMap::new(),
@@ -991,6 +1034,10 @@ impl NapDaemon {
 
     pub fn poll_interval(&self) -> Duration {
         Duration::from_millis(self.cfg.poll_interval_ms.max(250))
+    }
+
+    pub fn take_focus_changed(&self) -> bool {
+        self.wl_watcher.take_focus_changed()
     }
 
     fn maybe_reload_config(&mut self) {
@@ -1008,18 +1055,19 @@ impl NapDaemon {
 
         // 1. Prefer native Wayland wlroots foreign-toplevel watcher (labwc / wayfire / sway / hyprland)
         let wl = self.wl_watcher.snapshot();
-        let (focus_available, backend_label, focused_pid, focused_app): (
+        let (focus_available, backend_label, focused_pid, focused_app_id, focused_title): (
             bool,
             String,
             Option<i32>,
             Option<String>,
+            Option<String>,
         ) = if wl.connected {
-            let app_label = wl.focused_app_id.clone().or(wl.focused_title.clone());
             (
                 true,
                 format!("wayland-wlr ({})", wl.socket),
                 None,
-                app_label,
+                wl.focused_app_id.clone(),
+                wl.focused_title.clone(),
             )
         } else {
             let (fpid, backend) = detect_focused_pid();
@@ -1029,7 +1077,7 @@ impl NapDaemon {
                     .find(|p| p.pid == pid)
                     .map(|p| p.canonical_name())
             });
-            (fpid.is_some(), backend.to_string(), fpid, fapp)
+            (fpid.is_some(), backend.to_string(), fpid, fapp, None)
         };
 
         let focused_ancestors = focused_pid
@@ -1044,7 +1092,7 @@ impl NapDaemon {
             .cloned()
             .collect();
         for app in disabled_apps {
-            self.thaw_app(&app, verbose, "disabled in config");
+            self.thaw_app(&app, &[], verbose, "disabled in config");
         }
 
         // 3. Evaluate every opted-in app
@@ -1056,6 +1104,11 @@ impl NapDaemon {
             if is_protected_app(&app) {
                 continue;
             }
+
+            let display_name = self
+                .installed_apps
+                .get(&app.to_lowercase())
+                .map(|(_, d)| d.as_str());
 
             // Find all user-owned processes matching this app name + their descendants
             let direct_roots: HashSet<i32> = procs
@@ -1094,15 +1147,20 @@ impl NapDaemon {
             // Is this app currently focused?
             let is_focused = focused_pid.map(|f| all_pids_set.contains(&f)).unwrap_or(false)
                 || safe_pids.iter().any(|p| focused_ancestors.contains(p))
-                || focused_app
-                    .as_deref()
-                    .map(|fa| app_names_match(fa, &app))
-                    .unwrap_or(false);
+                || wayland_window_matches(
+                    &app,
+                    display_name,
+                    focused_app_id.as_deref(),
+                    focused_title.as_deref(),
+                );
 
             if is_focused {
                 self.unfocused_since.remove(&app);
-                if self.frozen_apps.contains_key(&app) {
-                    self.thaw_app(&app, verbose, "window focused");
+                let any_stopped_now = procs
+                    .iter()
+                    .any(|p| safe_pids.contains(&p.pid) && (p.state == 'T' || p.state == 't'));
+                if self.frozen_apps.contains_key(&app) || any_stopped_now {
+                    self.thaw_app(&app, &safe_pids, verbose, "window focused");
                 }
                 continue;
             }
@@ -1168,7 +1226,14 @@ impl NapDaemon {
             }
         }
 
-        // Publish live status for `pi-nap status` and `pi-stutter` TUI
+        // Format focused display string for `pi-nap status` and TUI
+        let focused_display = match (&focused_app_id, &focused_title) {
+            (Some(aid), Some(t)) if !t.eq_ignore_ascii_case(aid) => Some(format!("{aid} — {t}")),
+            (Some(aid), _) => Some(aid.clone()),
+            (None, Some(t)) => Some(t.clone()),
+            (None, None) => None,
+        };
+
         let total_frozen_pids = self.frozen_apps.values().map(|v| v.len()).sum();
         let status = NapLiveStatus {
             daemon_pid: std::process::id(),
@@ -1178,21 +1243,28 @@ impl NapDaemon {
                 .unwrap_or(0),
             focus_backend: backend_label,
             focused_pid,
-            focused_app,
+            focused_app: focused_display,
             frozen_apps: self.frozen_apps.clone(),
             total_frozen_pids,
         };
         write_live_status(&status);
     }
 
-    fn thaw_app(&mut self, app: &str, verbose: bool, reason: &str) {
+    fn thaw_app(&mut self, app: &str, extra_pids: &[i32], verbose: bool, reason: &str) {
+        let mut all = HashSet::new();
         if let Some(pids) = self.frozen_apps.remove(app) {
-            for pid in &pids {
-                send_signal(*pid, libc::SIGCONT);
+            for pid in pids {
+                all.insert(pid);
             }
-            if verbose {
-                eprintln!("[pi-nap] THAWED '{}' ({} pids) — {}", app, pids.len(), reason);
-            }
+        }
+        for &pid in extra_pids {
+            all.insert(pid);
+        }
+        for pid in &all {
+            send_signal(*pid, libc::SIGCONT);
+        }
+        if verbose && !all.is_empty() {
+            eprintln!("[pi-nap] THAWED '{}' ({} pids) — {}", app, all.len(), reason);
         }
         self.last_pulse.remove(app);
     }
@@ -1201,7 +1273,7 @@ impl NapDaemon {
     pub fn thaw_all(&mut self, verbose: bool) {
         let apps: Vec<String> = self.frozen_apps.keys().cloned().collect();
         for app in apps {
-            self.thaw_app(&app, verbose, "daemon stopping");
+            self.thaw_app(&app, &[], verbose, "daemon stopping");
         }
         let _ = fs::remove_file(status_path());
     }

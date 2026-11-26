@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,20 +34,36 @@ struct ToplevelInfo {
 struct WlrApp {
     manager_bound: bool,
     toplevels: HashMap<ObjectId, ToplevelInfo>,
+    last_activated: Option<ObjectId>,
     shared: Arc<Mutex<WaylandFocusState>>,
+    focus_changed: Arc<AtomicBool>,
     socket: String,
 }
 
 impl WlrApp {
     fn publish(&self) {
-        let active = self.toplevels.values().find(|t| t.activated);
+        // Prefer the most recently activated toplevel to avoid HashMap iteration order races
+        let active = self
+            .last_activated
+            .as_ref()
+            .and_then(|id| self.toplevels.get(id))
+            .filter(|t| t.activated)
+            .or_else(|| self.toplevels.values().find(|t| t.activated));
+
+        let new_app_id = active
+            .map(|t| t.app_id.clone())
+            .filter(|s| !s.is_empty());
+        let new_title = active.map(|t| t.title.clone()).filter(|s| !s.is_empty());
+
         if let Ok(mut st) = self.shared.lock() {
+            let changed = st.focused_app_id != new_app_id || st.focused_title != new_title;
             st.connected = self.manager_bound;
             st.socket = self.socket.clone();
-            st.focused_app_id = active
-                .map(|t| t.app_id.clone())
-                .filter(|s| !s.is_empty());
-            st.focused_title = active.map(|t| t.title.clone()).filter(|s| !s.is_empty());
+            st.focused_app_id = new_app_id;
+            st.focused_title = new_title;
+            if changed {
+                self.focus_changed.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -86,7 +103,9 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for WlrApp {
         _: &QueueHandle<Self>,
     ) {
         if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
-            state.toplevels.insert(toplevel.id(), ToplevelInfo::default());
+            state
+                .toplevels
+                .insert(toplevel.id(), ToplevelInfo::default());
         }
     }
 
@@ -113,7 +132,6 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WlrApp {
                 state.toplevels.entry(id).or_default().title = title;
             }
             zwlr_foreign_toplevel_handle_v1::Event::State { state: raw_bytes } => {
-                // Wayland array of u32 in native endianness
                 let mut activated = false;
                 for chunk in raw_bytes.chunks_exact(4) {
                     let val = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -121,13 +139,22 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for WlrApp {
                         activated = true;
                     }
                 }
-                state.toplevels.entry(id).or_default().activated = activated;
+                let entry = state.toplevels.entry(id.clone()).or_default();
+                entry.activated = activated;
+                if activated {
+                    state.last_activated = Some(id);
+                } else if state.last_activated.as_ref() == Some(&id) {
+                    state.last_activated = None;
+                }
             }
             zwlr_foreign_toplevel_handle_v1::Event::Done => {
                 state.publish();
             }
             zwlr_foreign_toplevel_handle_v1::Event::Closed => {
                 state.toplevels.remove(&id);
+                if state.last_activated.as_ref() == Some(&id) {
+                    state.last_activated = None;
+                }
                 state.publish();
             }
             _ => {}
@@ -189,17 +216,17 @@ pub fn probe_wayland_focus() -> Option<WaylandFocusState> {
     let mut app = WlrApp {
         manager_bound: false,
         toplevels: HashMap::new(),
+        last_activated: None,
         shared: Arc::clone(&shared),
+        focus_changed: Arc::new(AtomicBool::new(false)),
         socket: sock_name,
     };
 
     let _registry = display.get_registry(&qh, ());
-    // Roundtrip 1: discover globals & bind zwlr_foreign_toplevel_manager_v1
     queue.roundtrip(&mut app).ok()?;
     if !app.manager_bound {
         return None;
     }
-    // Roundtrip 2: receive initial toplevel list + app_id + state + done
     queue.roundtrip(&mut app).ok()?;
     app.publish();
 
@@ -210,27 +237,29 @@ pub fn probe_wayland_focus() -> Option<WaylandFocusState> {
 /// Long-running background Wayland focus watcher for `pi-nap run`.
 pub struct WaylandFocusWatcher {
     state: Arc<Mutex<WaylandFocusState>>,
+    focus_changed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
 impl WaylandFocusWatcher {
     pub fn start() -> Self {
         let state = Arc::new(Mutex::new(WaylandFocusState::default()));
+        let focus_changed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
 
         let st_bg = Arc::clone(&state);
+        let fc_bg = Arc::clone(&focus_changed);
         let stop_bg = Arc::clone(&stop);
 
         let _ = thread::Builder::new()
             .name("wayland-focus".into())
             .spawn(move || {
                 while !stop_bg.load(Ordering::Relaxed) {
-                    if let Err(_) = run_watcher_session(&st_bg, &stop_bg) {
+                    if run_watcher_session(&st_bg, &fc_bg, &stop_bg).is_err() {
                         if let Ok(mut s) = st_bg.lock() {
                             s.connected = false;
                         }
                     }
-                    // Wait before retrying connection
                     for _ in 0..20 {
                         if stop_bg.load(Ordering::Relaxed) {
                             break;
@@ -240,14 +269,20 @@ impl WaylandFocusWatcher {
                 }
             });
 
-        Self { state, stop }
+        Self {
+            state,
+            focus_changed,
+            stop,
+        }
     }
 
     pub fn snapshot(&self) -> WaylandFocusState {
-        self.state
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Returns true if focus changed since last check (clears flag).
+    pub fn take_focus_changed(&self) -> bool {
+        self.focus_changed.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -259,11 +294,11 @@ impl Drop for WaylandFocusWatcher {
 
 fn run_watcher_session(
     shared: &Arc<Mutex<WaylandFocusState>>,
+    focus_changed: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), ()> {
     let (sock_path, sock_name) = find_wayland_socket().ok_or(())?;
     let stream = UnixStream::connect(&sock_path).map_err(|_| ())?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let conn = Connection::from_socket(stream).map_err(|_| ())?;
     let display = conn.display();
     let mut queue = conn.new_event_queue::<WlrApp>();
@@ -272,7 +307,9 @@ fn run_watcher_session(
     let mut app = WlrApp {
         manager_bound: false,
         toplevels: HashMap::new(),
+        last_activated: None,
         shared: Arc::clone(shared),
+        focus_changed: Arc::clone(focus_changed),
         socket: sock_name,
     };
 
@@ -285,22 +322,36 @@ fn run_watcher_session(
     app.publish();
 
     while !stop.load(Ordering::Relaxed) {
+        queue.dispatch_pending(&mut app).map_err(|_| ())?;
         let _ = queue.flush();
+
         if let Some(guard) = queue.prepare_read() {
-            match guard.read() {
-                Ok(_) => {
-                    queue.dispatch_pending(&mut app).map_err(|_| ())?;
+            let fd = guard.connection_fd().as_raw_fd();
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+            if ret > 0 {
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    return Err(());
                 }
-                Err(wayland_client::backend::WaylandError::Io(ref e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Normal read timeout so we can check `stop` flag
+                match guard.read() {
+                    Ok(_) => {
+                        queue.dispatch_pending(&mut app).map_err(|_| ())?;
+                    }
+                    Err(wayland_client::backend::WaylandError::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return Err(()),
                 }
-                Err(_) => return Err(()),
+            } else if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(());
+                }
             }
-        } else {
-            queue.dispatch_pending(&mut app).map_err(|_| ())?;
+            // If ret == 0 (timeout), guard drops and cancels read cleanly.
         }
     }
 

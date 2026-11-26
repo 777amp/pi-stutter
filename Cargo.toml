@@ -1,6 +1,6 @@
 [package]
 name = "pi-stutter"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Lightweight Rust TUI profiler, process lag debugger, and App Nap background freezer for Raspberry Pi"
 license = "MIT"
