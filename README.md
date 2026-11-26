@@ -4,25 +4,25 @@ A lightweight Rust TUI profiler purpose-built to diagnose **Raspberry Pi micro-s
 
 ## Quick Download (Prebuilt Binaries)
 
-Grab the latest prebuilt binary for your Raspberry Pi from the [Releases](https://github.com/777amp/pi-stutter/releases/latest) page:
+Prebuilt, stripped release binaries are included in [`bin/`](https://github.com/777amp/pi-stutter/tree/main/bin):
 
 ### Raspberry Pi 64-bit OS (`aarch64` — Pi 3/4/5/Zero 2 W)
 ```bash
-curl -fsSL https://github.com/777amp/pi-stutter/releases/latest/download/pi-stutter-aarch64-unknown-linux-gnu -o pi-stutter
+curl -fsSL https://raw.githubusercontent.com/777amp/pi-stutter/main/bin/pi-stutter-aarch64-unknown-linux-gnu -o pi-stutter
 chmod +x pi-stutter
 ./pi-stutter
 ```
 
 ### Raspberry Pi 32-bit OS (`armv7` — Pi 2/3/4 32-bit)
 ```bash
-curl -fsSL https://github.com/777amp/pi-stutter/releases/latest/download/pi-stutter-armv7-unknown-linux-gnueabihf -o pi-stutter
+curl -fsSL https://raw.githubusercontent.com/777amp/pi-stutter/main/bin/pi-stutter-armv7-unknown-linux-gnueabihf -o pi-stutter
 chmod +x pi-stutter
 ./pi-stutter
 ```
 
 ### Linux x86_64
 ```bash
-curl -fsSL https://github.com/777amp/pi-stutter/releases/latest/download/pi-stutter-x86_64-unknown-linux-gnu -o pi-stutter
+curl -fsSL https://raw.githubusercontent.com/777amp/pi-stutter/main/bin/pi-stutter-x86_64-unknown-linux-gnu -o pi-stutter
 chmod +x pi-stutter
 ./pi-stutter
 ```
