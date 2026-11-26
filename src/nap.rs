@@ -899,13 +899,68 @@ fn collect_descendants(roots: &HashSet<i32>, procs: &[ProcEntry]) -> HashSet<i32
     result
 }
 
+/// Strips common Linux binary/desktop/Wayland suffixes and reverse-DNS prefixes
+/// so `chromium-browser`, `chromium`, `org.mozilla.firefox`, `firefox-esr`, etc. match cleanly.
+fn app_stem(raw: &str) -> String {
+    let norm = normalize_app_name(raw).to_lowercase();
+    let without_desktop = norm.strip_suffix(".desktop").unwrap_or(&norm);
+    // Reverse-DNS Wayland app_id like "org.mozilla.firefox" -> "firefox"
+    let last_dot = if without_desktop.contains('.') {
+        without_desktop.rsplit('.').next().unwrap_or(without_desktop)
+    } else {
+        without_desktop
+    };
+    let mut s = last_dot.to_string();
+    for suffix in [
+        "-browser",
+        "-esr",
+        "-stable",
+        "-wayland",
+        "-bin",
+        "-oss",
+        "-gui",
+    ] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            if stripped.len() >= 3 {
+                s = stripped.to_string();
+            }
+        }
+    }
+    s
+}
+
+pub fn app_names_match(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let na = normalize_app_name(a).to_lowercase();
+    let nb = normalize_app_name(b).to_lowercase();
+    if na == nb {
+        return true;
+    }
+    let sa = app_stem(&na);
+    let sb = app_stem(&nb);
+    if !sa.is_empty() && sa == sb {
+        return true;
+    }
+    // Handle 15-character /proc/<pid>/comm truncation (e.g. "chromium-browse" vs "chromium-browser")
+    if na.len() == 15 && nb.starts_with(&na) {
+        return true;
+    }
+    if nb.len() == 15 && na.starts_with(&nb) {
+        return true;
+    }
+    false
+}
+
 /// Stateful App Nap controller used by the `pi-nap` daemon.
 pub struct NapDaemon {
     cfg: NapConfig,
     cfg_mtime: Option<SystemTime>,
     my_uid: u32,
     my_ancestors: HashSet<i32>,
-    /// Tracks when each enabled app was last seen focused (or first seen unfocused).
+    wl_watcher: crate::wayland_focus::WaylandFocusWatcher,
+    /// Tracks when each enabled app was last seen unfocused.
     unfocused_since: HashMap<String, Instant>,
     /// Currently frozen PIDs per app name.
     frozen_apps: BTreeMap<String, Vec<i32>>,
@@ -920,12 +975,14 @@ impl NapDaemon {
         let my_ancestors = ancestor_and_self_set(my_pid, &procs);
         let cfg = NapConfig::load();
         let cfg_mtime = fs::metadata(config_path()).and_then(|m| m.modified()).ok();
+        let wl_watcher = crate::wayland_focus::WaylandFocusWatcher::start();
 
         Self {
             cfg,
             cfg_mtime,
             my_uid: current_uid(),
             my_ancestors,
+            wl_watcher,
             unfocused_since: HashMap::new(),
             frozen_apps: BTreeMap::new(),
             last_pulse: HashMap::new(),
@@ -948,19 +1005,38 @@ impl NapDaemon {
         self.maybe_reload_config();
 
         let procs = scan_processes();
-        let (focused_pid, backend) = detect_focused_pid();
+
+        // 1. Prefer native Wayland wlroots foreign-toplevel watcher (labwc / wayfire / sway / hyprland)
+        let wl = self.wl_watcher.snapshot();
+        let (focus_available, backend_label, focused_pid, focused_app): (
+            bool,
+            String,
+            Option<i32>,
+            Option<String>,
+        ) = if wl.connected {
+            let app_label = wl.focused_app_id.clone().or(wl.focused_title.clone());
+            (
+                true,
+                format!("wayland-wlr ({})", wl.socket),
+                None,
+                app_label,
+            )
+        } else {
+            let (fpid, backend) = detect_focused_pid();
+            let fapp = fpid.and_then(|pid| {
+                procs
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| p.canonical_name())
+            });
+            (fpid.is_some(), backend.to_string(), fpid, fapp)
+        };
+
         let focused_ancestors = focused_pid
             .map(|pid| ancestor_and_self_set(pid, &procs))
             .unwrap_or_default();
 
-        let focused_app = focused_pid.and_then(|fpid| {
-            procs
-                .iter()
-                .find(|p| p.pid == fpid)
-                .map(|p| p.canonical_name())
-        });
-
-        // 1. Thaw any previously frozen app that is no longer enabled in config
+        // 2. Thaw any previously frozen app that is no longer enabled in config
         let disabled_apps: Vec<String> = self
             .frozen_apps
             .keys()
@@ -971,7 +1047,7 @@ impl NapDaemon {
             self.thaw_app(&app, verbose, "disabled in config");
         }
 
-        // 2. Evaluate every opted-in app
+        // 3. Evaluate every opted-in app
         let enabled_list: Vec<String> = self.cfg.enabled_apps.iter().cloned().collect();
         let now = Instant::now();
         let grace = Duration::from_secs(self.cfg.grace_secs);
@@ -990,8 +1066,8 @@ impl NapDaemon {
                         && p.pid > 2
                         && !self.my_ancestors.contains(&p.pid)
                         && !is_protected_app(&p.canonical_name())
-                        && (p.canonical_name().eq_ignore_ascii_case(&app)
-                            || p.comm.eq_ignore_ascii_case(&app))
+                        && (app_names_match(&p.canonical_name(), &app)
+                            || app_names_match(&p.comm, &app))
                 })
                 .map(|p| p.pid)
                 .collect();
@@ -1020,7 +1096,7 @@ impl NapDaemon {
                 || safe_pids.iter().any(|p| focused_ancestors.contains(p))
                 || focused_app
                     .as_deref()
-                    .map(|fa| fa.eq_ignore_ascii_case(&app))
+                    .map(|fa| app_names_match(fa, &app))
                     .unwrap_or(false);
 
             if is_focused {
@@ -1031,9 +1107,8 @@ impl NapDaemon {
                 continue;
             }
 
-            // If we couldn't detect ANY focused window (e.g., unsupported compositor or headless),
-            // do NOT blindly freeze apps unless focus detection is actually working.
-            if focused_pid.is_none() {
+            // If we have NO working focus backend at all, do NOT blindly freeze apps.
+            if !focus_available {
                 continue;
             }
 
@@ -1101,7 +1176,7 @@ impl NapDaemon {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            focus_backend: backend.to_string(),
+            focus_backend: backend_label,
             focused_pid,
             focused_app,
             frozen_apps: self.frozen_apps.clone(),
@@ -1141,15 +1216,31 @@ impl Drop for NapDaemon {
 pub fn install_systemd_user_service() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("cannot locate pi-nap binary path")?;
     let home = std::env::var("HOME").context("HOME not set")?;
-    let dir = PathBuf::from(home).join(".config/systemd/user");
+    let dir = PathBuf::from(&home).join(".config/systemd/user");
     fs::create_dir_all(&dir)?;
     let unit_path = dir.join("pi-nap.service");
 
+    let uid = current_uid();
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("/run/user/{uid}"));
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-    let mut env_lines = format!("Environment=DISPLAY={display}\n");
+    let wayland = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| crate::wayland_focus::find_wayland_socket().map(|(_, name)| name))
+        .unwrap_or_default();
+    let xauth = std::env::var("XAUTHORITY").unwrap_or_default();
+
+    let mut env_lines = format!(
+        "Environment=XDG_RUNTIME_DIR={runtime_dir}\nEnvironment=DISPLAY={display}\n"
+    );
     if !wayland.is_empty() {
         env_lines.push_str(&format!("Environment=WAYLAND_DISPLAY={wayland}\n"));
+    }
+    if !xauth.is_empty() {
+        env_lines.push_str(&format!("Environment=XAUTHORITY={xauth}\n"));
     }
 
     let unit = format!(

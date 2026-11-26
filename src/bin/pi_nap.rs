@@ -308,29 +308,23 @@ fn run_setup() -> Result<()> {
         cfg.enabled_apps.len()
     );
 
-    let (focused_pid, backend) = detect_focused_pid();
-    if backend != "none" {
+    if let Some(wl) = pi_stutter::wayland_focus::probe_wayland_focus() {
         println!(
-            "[2/4] Window focus backend detected: {backend} (focused pid: {:?})",
-            focused_pid
+            "[2/4] Window focus backend detected: wayland-wlr ({}) — focused: {:?}",
+            wl.socket,
+            wl.focused_app_id.or(wl.focused_title)
         );
     } else {
-        let has_xdotool = Command::new("which")
-            .arg("xdotool")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let has_xprop = Command::new("which")
-            .arg("xprop")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if has_xdotool || has_xprop {
-            println!("[2/4] Window focus tools installed (xdotool/xprop), waiting for active desktop session.");
+        let (focused_pid, backend) = detect_focused_pid();
+        if backend != "none" {
+            println!(
+                "[2/4] Window focus backend detected: {backend} (focused pid: {:?})",
+                focused_pid
+            );
         } else {
-            println!("[2/4] Note: no X11/Wayland focus tool detected yet.");
-            println!("      For Raspberry Pi desktop (X11/XWayland), install xdotool:");
-            println!("        sudo apt-get update && sudo apt-get install -y xdotool");
+            println!("[2/4] Note: no active Wayland wlroots or X11 focus backend detected yet.");
+            println!("      On Wayland (labwc/wayfire/sway/hyprland), pi-nap connects natively once your desktop session is active.");
+            println!("      On X11, install xdotool: sudo apt-get install -y xdotool");
         }
     }
 
@@ -346,10 +340,13 @@ fn run_setup() -> Result<()> {
     let enable = Command::new("systemctl")
         .args(["--user", "enable", "--now", "pi-nap"])
         .status();
+    let restart = Command::new("systemctl")
+        .args(["--user", "restart", "pi-nap"])
+        .status();
 
-    match (reload, enable) {
-        (Ok(r), Ok(e)) if r.success() && e.success() => {
-            println!("[4/4] Service enabled and started via systemd (`pi-nap.service`).");
+    match (reload, enable, restart) {
+        (Ok(r), Ok(e), Ok(rs)) if r.success() && e.success() && rs.success() => {
+            println!("[4/4] Service enabled and (re)started via systemd (`pi-nap.service`).");
         }
         _ => {
             println!("[4/4] Could not auto-start systemd user service (common over non-login SSH or containers).");
