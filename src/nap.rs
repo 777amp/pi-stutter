@@ -880,12 +880,20 @@ pub fn install_systemd_user_service() -> Result<PathBuf> {
     fs::create_dir_all(&dir)?;
     let unit_path = dir.join("pi-nap.service");
 
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+    let wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let mut env_lines = format!("Environment=DISPLAY={display}\n");
+    if !wayland.is_empty() {
+        env_lines.push_str(&format!("Environment=WAYLAND_DISPLAY={wayland}\n"));
+    }
+
     let unit = format!(
         "[Unit]\n\
          Description=pi-nap — macOS App Nap-style background app freezer for Raspberry Pi\n\
          After=graphical-session.target\n\n\
          [Service]\n\
          Type=simple\n\
+         {env_lines}\
          ExecStart={} run\n\
          Restart=on-failure\n\
          RestartSec=3\n\n\
