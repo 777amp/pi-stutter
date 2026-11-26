@@ -6,9 +6,12 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use pi_stutter::nap::{NapConfig, NapLiveStatus, RunningApp};
+
 use crate::analyzer::{Analyzer, Severity};
+use crate::attach::AttachSnapshot;
 use crate::jitter::JitterSnapshot;
-use crate::metrics::SystemSnapshot;
+use crate::metrics::{ProcessMetric, SystemSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -16,6 +19,8 @@ pub enum Tab {
     Processes = 1,
     IoIrq = 2,
     Diagnostics = 3,
+    Attach = 4,
+    AppNap = 5,
 }
 
 impl Tab {
@@ -25,6 +30,8 @@ impl Tab {
             "2: Processes",
             "3: I/O & IRQs",
             "4: Diagnostics",
+            "5: Attach",
+            "6: App Nap",
         ]
     }
 
@@ -33,7 +40,9 @@ impl Tab {
             Tab::Overview => Tab::Processes,
             Tab::Processes => Tab::IoIrq,
             Tab::IoIrq => Tab::Diagnostics,
-            Tab::Diagnostics => Tab::Overview,
+            Tab::Diagnostics => Tab::Attach,
+            Tab::Attach => Tab::AppNap,
+            Tab::AppNap => Tab::Overview,
         }
     }
 }
@@ -61,11 +70,18 @@ pub struct UiState<'a> {
     pub tab: Tab,
     pub paused: bool,
     pub proc_sort: ProcSort,
+    pub proc_selected: usize,
+    pub sorted_procs: &'a [ProcessMetric],
     pub snap: &'a SystemSnapshot,
     pub jitter: &'a JitterSnapshot,
     pub analyzer: &'a Analyzer,
     pub jitter_history_us: &'a [u64],
     pub cpu_history: &'a [u64],
+    pub attach_snap: Option<&'a AttachSnapshot>,
+    pub nap_cfg: &'a NapConfig,
+    pub nap_status: Option<&'a NapLiveStatus>,
+    pub nap_apps: &'a [RunningApp],
+    pub nap_selected: usize,
     pub status_msg: Option<&'a str>,
 }
 
@@ -88,6 +104,8 @@ pub fn draw(f: &mut Frame, ui: &UiState<'_>) {
         Tab::Processes => draw_processes(f, chunks[2], ui),
         Tab::IoIrq => draw_io_irq(f, chunks[2], ui),
         Tab::Diagnostics => draw_diagnostics(f, chunks[2], ui),
+        Tab::Attach => draw_attach(f, chunks[2], ui),
+        Tab::AppNap => draw_app_nap(f, chunks[2], ui),
     }
 
     draw_footer(f, chunks[3], ui);
@@ -98,15 +116,23 @@ fn draw_header(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     let temp_span = match snap.temp_c {
         Some(t) if t >= 80.0 => Span::styled(
             format!(" {t:.1}°C "),
-            Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Some(t) if t >= 70.0 => Span::styled(
             format!(" {t:.1}°C "),
-            Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
         ),
         Some(t) => Span::styled(
             format!(" {t:.1}°C "),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         None => Span::styled(" Temp:N/A ", Style::default().fg(Color::DarkGray)),
     };
@@ -120,22 +146,33 @@ fn draw_header(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     let throttle_span = if snap.throttle.under_voltage_now {
         Span::styled(
             " ⚡ UNDER-VOLTAGE! ",
-            Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )
     } else if snap.throttle.throttled_now {
         Span::styled(
             " 🔥 THROTTLED! ",
-            Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )
     } else if snap.throttle.freq_capped_now || snap.throttle.soft_temp_limit_now {
         Span::styled(
             " ⚠ FREQ CAPPED ",
-            Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
         )
     } else if snap.throttle.any_historical() {
         Span::styled(
             " ⚠ PAST THROTTLE ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )
     } else if snap.throttle.raw.is_some() {
         Span::styled(" ✓ PWR/THRM OK ", Style::default().fg(Color::Green))
@@ -146,7 +183,10 @@ fn draw_header(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     let pause_span = if ui.paused {
         Span::styled(
             " [PAUSED] ",
-            Style::default().bg(Color::Magenta).fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Magenta)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw("")
@@ -155,7 +195,9 @@ fn draw_header(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     let line = Line::from(vec![
         Span::styled(
             " pi-stutter ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("│ "),
         Span::styled(&snap.model, Style::default().fg(Color::White)),
@@ -209,7 +251,6 @@ fn draw_overview(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         ])
         .split(area);
 
-    // Row 0: Jitter Sparkline + CPU Sparkline
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -270,7 +311,6 @@ fn draw_overview(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         .style(Style::default().fg(cpu_color));
     f.render_widget(cpu_spark, top_cols[1]);
 
-    // Row 1: PSI Gauges + Memory/Swap
     let mid_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -278,8 +318,6 @@ fn draw_overview(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
 
     draw_psi_box(f, mid_cols[0], ui);
     draw_mem_box(f, mid_cols[1], ui);
-
-    // Row 2: Recent Stutter Events
     draw_events_list(f, rows[2], ui);
 }
 
@@ -368,7 +406,12 @@ fn draw_mem_box(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         Gauge::default()
             .gauge_style(Style::default().fg(ram_color).bg(Color::DarkGray))
             .ratio(ram_ratio)
-            .label(format!("RAM: {:.0}/{:.0} MB ({:.0}%)", m.used_mb, m.total_mb, ram_ratio * 100.0)),
+            .label(format!(
+                "RAM: {:.0}/{:.0} MB ({:.0}%)",
+                m.used_mb,
+                m.total_mb,
+                ram_ratio * 100.0
+            )),
         rows[0],
     );
 
@@ -394,7 +437,10 @@ fn draw_mem_box(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     );
 
     let extra = Paragraph::new(Line::from(vec![
-        Span::raw(format!("Dirty: {:.1}MB  Writeback: {:.1}MB  ", m.dirty_mb, m.writeback_mb)),
+        Span::raw(format!(
+            "Dirty: {:.1}MB  Writeback: {:.1}MB  ",
+            m.dirty_mb, m.writeback_mb
+        )),
         Span::styled(
             format!("MajFlt: {:.0}/s", m.maj_faults_per_sec),
             Style::default().fg(if m.maj_faults_per_sec > 15.0 {
@@ -414,14 +460,16 @@ fn draw_events_list(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     );
 
     if ui.analyzer.events.is_empty() {
-        let p = Paragraph::new("No stutter events detected yet. System looks smooth! (Use +/- to lower jitter threshold)")
-            .style(Style::default().fg(Color::Green))
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
+        let p = Paragraph::new(
+            "No stutter events detected yet. System looks smooth! (Use +/- to lower jitter threshold)",
+        )
+        .style(Style::default().fg(Color::Green))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         f.render_widget(p, area);
         return;
     }
@@ -437,7 +485,10 @@ fn draw_events_list(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
                 Severity::Warn => ("WARN", Color::Yellow),
             };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", ev.timestamp), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", ev.timestamp),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("[{sev_str}] "),
                     Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
@@ -466,63 +517,57 @@ fn draw_events_list(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
 }
 
 fn draw_processes(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
-    let mut procs = ui.snap.processes.clone();
-    match ui.proc_sort {
-        ProcSort::Cpu => procs.sort_by(|a, b| {
-            b.cpu_pct
-                .partial_cmp(&a.cpu_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        ProcSort::Memory => procs.sort_by(|a, b| {
-            b.rss_mb
-                .partial_cmp(&a.rss_mb)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        ProcSort::MajFaults => procs.sort_by(|a, b| {
-            b.maj_flt_per_sec
-                .partial_cmp(&a.maj_flt_per_sec)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        ProcSort::State => procs.sort_by(|a, b| {
-            let rank = |s: char| match s {
-                'D' => 0,
-                'R' => 1,
-                _ => 2,
-            };
-            rank(a.state).cmp(&rank(b.state)).then_with(|| {
-                b.cpu_pct
-                    .partial_cmp(&a.cpu_pct)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        }),
-    }
-
-    let header = Row::new(vec!["PID", "NAME", "STATE", "CPU %", "MAJFLT/s", "RSS (MB)"])
+    let header = Row::new(vec!["", "PID", "NAME", "STATE", "CPU %", "MAJFLT/s", "RSS (MB)"])
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = procs
-        .into_iter()
-        .take(area.height.saturating_sub(3) as usize)
-        .map(|p| {
+    let max_rows = area.height.saturating_sub(3) as usize;
+    let scroll_offset = if ui.proc_selected >= max_rows && max_rows > 0 {
+        ui.proc_selected - max_rows + 1
+    } else {
+        0
+    };
+
+    let rows: Vec<Row> = ui
+        .sorted_procs
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(max_rows)
+        .map(|(idx, p)| {
+            let selected = idx == ui.proc_selected;
             let state_style = match p.state {
                 'D' => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                'T' | 't' => Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
                 'R' => Style::default().fg(Color::Green),
                 _ => Style::default().fg(Color::DarkGray),
             };
+            let row_style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
             Row::new(vec![
+                Cell::from(if selected { "▶" } else { " " }),
                 Cell::from(p.pid.to_string()),
-                Cell::from(p.name),
+                Cell::from(p.name.clone()),
                 Cell::from(p.state.to_string()).style(state_style),
                 Cell::from(format!("{:5.1}", p.cpu_pct)),
                 Cell::from(format!("{:6.1}", p.maj_flt_per_sec)),
                 Cell::from(format!("{:7.1}", p.rss_mb)),
             ])
+            .style(row_style)
         })
         .collect();
 
     let table = Table::new(
         rows,
         [
+            Constraint::Length(2),
             Constraint::Length(8),
             Constraint::Min(20),
             Constraint::Length(7),
@@ -535,7 +580,7 @@ fn draw_processes(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     .block(
         Block::default()
             .title(format!(
-                " Top Processes (sort: {} — keys: c=CPU m=Mem f=MajFlt d=State/D) ",
+                " Processes (sort: {} | ↑↓ select | Enter: Attach | n: Toggle App Nap | c/m/f/d sort) ",
                 ui.proc_sort.label()
             ))
             .borders(Borders::ALL)
@@ -551,7 +596,6 @@ fn draw_io_irq(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    // Disks
     let disk_header = Row::new(vec![
         "DEVICE",
         "READ KB/s",
@@ -606,7 +650,6 @@ fn draw_io_irq(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     );
     f.render_widget(disk_table, cols[0]);
 
-    // IRQs
     let irq_header = Row::new(vec!["IRQ", "RATE / sec", "DEVICE / HANDLER"])
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
@@ -660,7 +703,9 @@ fn draw_diagnostics(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         let badge = if hc.ok {
             Span::styled(
                 " [OK]   ",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
@@ -670,7 +715,12 @@ fn draw_diagnostics(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
         };
         lines.push(Line::from(vec![
             badge,
-            Span::styled(hc.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                hc.name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(": "),
             Span::styled(
                 hc.status,
@@ -697,15 +747,414 @@ fn draw_diagnostics(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     f.render_widget(p, area);
 }
 
+fn draw_attach(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
+    let Some(a) = ui.attach_snap else {
+        let msg = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  No process attached yet.",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("  How to attach and diagnose why a specific app (like chromium or EasyCLIProxyAPI) is laggy:"),
+            Line::raw("   • Press '2' to go to the Processes tab, select a process with ↑/↓, and press Enter."),
+            Line::raw("   • Or launch directly with:  pi-stutter --attach chromium"),
+            Line::raw("   • Or attach to a PID with:  pi-stutter --attach 1234"),
+        ];
+        f.render_widget(
+            Paragraph::new(msg)
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(" Deep Process Lag Profiler ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                ),
+            area,
+        );
+        return;
+    };
+
+    if !a.alive {
+        let p = Paragraph::new(format!(
+            "Target {} is not running (waiting for process to appear, or press 'x' to detach)...",
+            a.target_label
+        ))
+        .style(Style::default().fg(Color::Yellow))
+        .block(
+            Block::default()
+                .title(format!(" Attached: {} ", a.target_label))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // Sparklines: Sched Wait & Hottest Thread CPU
+            Constraint::Length(8), // Metrics summary + Diagnosis findings
+            Constraint::Min(6),    // Top threads + WCHAN table
+        ])
+        .split(area);
+
+    // Row 0: Sparklines
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+
+    let wait_color = if a.sched_wait_ms >= 20.0 {
+        Color::Red
+    } else if a.sched_wait_ms >= 5.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    f.render_widget(
+        Sparkline::default()
+            .block(
+                Block::default()
+                    .title(format!(
+                        " {} Runqueue Wait: {:.1}ms (peak {:.1}ms) ",
+                        a.target_label, a.sched_wait_ms, a.sched_wait_peak_ms
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(wait_color)),
+            )
+            .data(&a.wait_history_us)
+            .style(Style::default().fg(wait_color)),
+        top_cols[0],
+    );
+
+    let thr_color = if a.hottest_thread_cpu_pct >= 80.0 {
+        Color::Red
+    } else if a.hottest_thread_cpu_pct >= 50.0 {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    f.render_widget(
+        Sparkline::default()
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Hottest Thread: '{}' {:.0}% | Total CPU: {:.0}% ({} pids, {} thr) ",
+                        a.hottest_thread_name,
+                        a.hottest_thread_cpu_pct,
+                        a.total_cpu_pct,
+                        a.matched_pids.len(),
+                        a.total_threads
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(thr_color)),
+            )
+            .data(&a.cpu_history)
+            .max(100)
+            .style(Style::default().fg(thr_color)),
+        top_cols[1],
+    );
+
+    // Row 1: Stats + Diagnosis
+    let mid_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(rows[1]);
+
+    let stats_lines = vec![
+        Line::from(format!(
+            "RAM: {:.0}MB  Swap: {:.0}MB  FDs: {}  D-State: {}",
+            a.rss_mb, a.swap_mb, a.open_fds, a.d_state_threads
+        )),
+        Line::from(format!(
+            "Sched: run={:.1}ms  wait={:.1}ms  (peak {:.1}ms)",
+            a.sched_run_ms, a.sched_wait_ms, a.sched_wait_peak_ms
+        )),
+        Line::from(format!(
+            "CtxSw/s: vol={:.0}  invol={:.0}",
+            a.vol_ctxt_per_sec, a.nonvol_ctxt_per_sec
+        )),
+        Line::from(format!(
+            "Faults/s: min={:.0}  maj={:.1}",
+            a.minflt_per_sec, a.majflt_per_sec
+        )),
+        Line::from(format!(
+            "Disk I/O: R={:.0} KB/s  W={:.0} KB/s",
+            a.io_read_kb_s, a.io_write_kb_s
+        )),
+        Line::from(format!(
+            "Syscalls: R={:.0}/s ({:.0}KB)  W={:.0}/s ({:.0}KB)",
+            a.io_syscr_s, a.io_rchar_kb_s, a.io_syscw_s, a.io_wchar_kb_s
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(stats_lines).block(
+            Block::default()
+                .title(" Process Internals (press 'x' to detach) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        mid_cols[0],
+    );
+
+    let finding_lines: Vec<Line> = a
+        .findings
+        .iter()
+        .flat_map(|fnd| {
+            let color = match fnd.severity {
+                "CRIT" => Color::Red,
+                "WARN" => Color::Yellow,
+                _ => Color::Cyan,
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", fnd.severity),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        fnd.title.clone(),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!("  {}", fnd.detail),
+                    Style::default().fg(Color::Gray),
+                )),
+            ]
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(finding_lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Why Is This App Laggy? ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+        mid_cols[1],
+    );
+
+    // Row 2: Threads table with WCHAN
+    let thr_header = Row::new(vec![
+        "TID",
+        "PID",
+        "THREAD NAME",
+        "STATE",
+        "CPU %",
+        "KERNEL WAIT (WCHAN)",
+    ])
+    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+    let thr_rows: Vec<Row> = a
+        .threads
+        .iter()
+        .take(rows[2].height.saturating_sub(3) as usize)
+        .map(|t| {
+            let st_style = match t.state {
+                'D' => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                'R' => Style::default().fg(Color::Green),
+                _ => Style::default().fg(Color::DarkGray),
+            };
+            Row::new(vec![
+                Cell::from(t.tid.to_string()),
+                Cell::from(t.pid.to_string()),
+                Cell::from(t.name.clone()),
+                Cell::from(t.state.to_string()).style(st_style),
+                Cell::from(format!("{:5.1}", t.cpu_pct)),
+                Cell::from(t.wchan.clone()),
+            ])
+        })
+        .collect();
+
+    let thr_table = Table::new(
+        thr_rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(20),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Min(20),
+        ],
+    )
+    .header(thr_header)
+    .block(
+        Block::default()
+            .title(" Per-Thread Breakdown (D-state & hottest threads first) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(thr_table, rows[2]);
+}
+
+fn draw_app_nap(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // Daemon & config summary
+            Constraint::Min(8),    // Running user apps toggle table
+        ])
+        .split(area);
+
+    let (daemon_span, focus_str, frozen_str) = match ui.nap_status {
+        Some(st) => (
+            Span::styled(
+                format!(" RUNNING (pid {}) ", st.daemon_pid),
+                Style::default()
+                    .bg(Color::Green)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            format!(
+                "{} (backend: {})",
+                st.focused_app.as_deref().unwrap_or("none"),
+                st.focus_backend
+            ),
+            format!(
+                "{} app(s) / {} pid(s)",
+                st.frozen_apps.len(),
+                st.total_frozen_pids
+            ),
+        ),
+        None => (
+            Span::styled(
+                " NOT RUNNING ",
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            "start daemon: `pi-nap run` or `pi-nap install-service`".into(),
+            "0".into(),
+        ),
+    };
+
+    let summary = vec![
+        Line::from(vec![
+            Span::raw("Daemon: "),
+            daemon_span,
+            Span::raw(format!("   Focused: {focus_str}")),
+        ]),
+        Line::from(format!(
+            "Opt-in Policy: ALL apps unfrozen by default | Enabled: {} | Currently Frozen: {}",
+            ui.nap_cfg.enabled_apps.len(),
+            frozen_str
+        )),
+        Line::from(format!(
+            "Timing: Grace={}s unfocused | Non-breaking Pulse: every {}s for {}ms  (Terminals & system apps are always PROTECTED)",
+            ui.nap_cfg.grace_secs, ui.nap_cfg.pulse_interval_secs, ui.nap_cfg.pulse_duration_ms
+        )),
+    ];
+
+    f.render_widget(
+        Paragraph::new(summary).block(
+            Block::default()
+                .title(" pi-nap — macOS App Nap-Style Background Freezer ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        rows[0],
+    );
+
+    let header = Row::new(vec!["", "APP NAME", "FREEZE OPT-IN", "PIDS", "LIVE STATE"])
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+    let max_rows = rows[1].height.saturating_sub(3) as usize;
+    let scroll = if ui.nap_selected >= max_rows && max_rows > 0 {
+        ui.nap_selected - max_rows + 1
+    } else {
+        0
+    };
+
+    let table_rows: Vec<Row> = ui
+        .nap_apps
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(max_rows)
+        .map(|(idx, app)| {
+            let selected = idx == ui.nap_selected;
+            let (opt_text, opt_style) = if app.protected {
+                (
+                    "[PROTECTED]",
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else if app.enabled {
+                (
+                    "[ON — Freeze]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("[off]", Style::default().fg(Color::Gray))
+            };
+
+            let live = if app.any_stopped {
+                Span::styled("❄ FROZEN", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            } else if app.focused {
+                Span::styled("● FOCUSED", Style::default().fg(Color::Cyan))
+            } else {
+                Span::styled("active", Style::default().fg(Color::DarkGray))
+            };
+
+            let row_style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![
+                Cell::from(if selected { "▶" } else { " " }),
+                Cell::from(app.name.clone()),
+                Cell::from(opt_text).style(opt_style),
+                Cell::from(app.pids.len().to_string()),
+                Cell::from(Line::from(live)),
+            ])
+            .style(row_style)
+        })
+        .collect();
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(2),
+            Constraint::Min(24),
+            Constraint::Length(16),
+            Constraint::Length(8),
+            Constraint::Length(14),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" Running User Apps (↑↓ select | Space/Enter: Toggle Freeze | u: Thaw All | a: Attach) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(table, rows[1]);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, ui: &UiState<'_>) {
     let text = if let Some(msg) = ui.status_msg {
         Line::from(Span::styled(
             format!(" {msg}"),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ))
     } else {
         Line::from(Span::styled(
-            " [q] Quit  [Tab/1-4] Views  [p] Pause  [r] Reset  [+/-] Jitter Thr  [s] Save Report",
+            " [q] Quit  [Tab/1-6] Views  [p] Pause  [r] Reset  [+/-] Jitter Thr  [s] Save Report",
             Style::default().fg(Color::DarkGray),
         ))
     };
