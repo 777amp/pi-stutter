@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +20,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
 use pi_stutter::nap::{
-    config_path, detect_focused_pid, install_systemd_user_service, list_running_apps,
-    read_live_status, thaw_user_apps, NapConfig, NapDaemon, NapLiveStatus, RunningApp,
+    config_path, detect_focused_pid, discover_installed_apps, discover_user_services,
+    install_systemd_user_service, list_all_apps, read_live_status, thaw_user_apps, AppKind,
+    NapConfig, NapDaemon, NapLiveStatus, RunningApp,
 };
 
 #[derive(Parser, Debug)]
@@ -37,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Launch interactive TUI to toggle apps and edit settings (default when no subcommand is given)
+    /// Launch interactive TUI to toggle apps/services and edit settings (default)
     Tui,
     /// One-shot setup: initialize config, check window-focus tools, install & start systemd user service
     Setup,
@@ -53,8 +54,12 @@ enum Commands {
     Enable { app: String },
     /// Disable freeze-when-unfocused for an app (and immediately thaw it)
     Disable { app: String },
-    /// List running user apps and their freeze opt-in / protected status
-    List,
+    /// List installed & running applications and services
+    List {
+        /// Filter: all, apps, services, running
+        #[arg(short, long, default_value = "all")]
+        filter: String,
+    },
     /// Show daemon status, focused window, and currently frozen apps
     Status,
     /// Immediately unfreeze one app or all stopped user apps
@@ -146,16 +151,32 @@ fn main() -> Result<()> {
             println!("Disabled App Nap freezing for '{app}' (thawed {thawed} process(es)).");
             Ok(())
         }
-        Commands::List => {
+        Commands::List { filter } => {
             let cfg = NapConfig::load();
             let (focused_pid, backend) = detect_focused_pid();
-            let apps = list_running_apps(&cfg, focused_pid);
+            let installed = discover_installed_apps();
+            let services = discover_user_services();
+            let mut apps = list_all_apps(&cfg, focused_pid, &installed, &services);
+
+            let f_mode = match filter.to_lowercase().as_str() {
+                "app" | "apps" | "applications" => FilterMode::AppsOnly,
+                "svc" | "service" | "services" => FilterMode::ServicesOnly,
+                "run" | "running" => FilterMode::RunningOnly,
+                "enabled" | "on" => FilterMode::EnabledOnly,
+                _ => FilterMode::All,
+            };
+            apps = apply_filter_and_sort(apps, f_mode, SortMode::AppsFirst, "");
+
             println!(
-                "Focus backend: {backend} | Config: {}",
-                config_path().display()
+                "Focus backend: {backend} | Filter: {} | Total: {}",
+                f_mode.label(),
+                apps.len()
             );
-            println!("{:<24} {:<12} {:<8} {}", "APP", "STATUS", "PIDS", "NOTES");
-            println!("{}", "-".repeat(64));
+            println!(
+                "{:<24} {:<9} {:<11} {:<6} {}",
+                "APP / BINARY", "TYPE", "STATUS", "PIDS", "STATE / NAME"
+            );
+            println!("{}", "-".repeat(76));
             for a in apps {
                 let status = if a.protected {
                     "PROTECTED"
@@ -164,19 +185,26 @@ fn main() -> Result<()> {
                 } else {
                     "off"
                 };
-                let mut notes = Vec::new();
-                if a.focused {
-                    notes.push("FOCUSED");
-                }
-                if a.any_stopped {
-                    notes.push("FROZEN");
-                }
+                let state = if a.pids.is_empty() {
+                    "installed"
+                } else if a.any_stopped {
+                    "FROZEN"
+                } else if a.focused {
+                    "FOCUSED"
+                } else {
+                    "running"
+                };
+                let extra = match &a.display_name {
+                    Some(d) if !d.eq_ignore_ascii_case(&a.name) => format!("{state} ({d})"),
+                    _ => state.to_string(),
+                };
                 println!(
-                    "{:<24} {:<12} {:<8} {}",
+                    "{:<24} {:<9} {:<11} {:<6} {}",
                     a.name,
+                    a.kind.label(),
                     status,
                     a.pids.len(),
-                    notes.join(" ")
+                    extra
                 );
             }
             Ok(())
@@ -190,7 +218,11 @@ fn main() -> Result<()> {
                 if cfg.enabled_apps.is_empty() {
                     "(none — opt-in with `pi-nap` TUI or `pi-nap toggle <app>`)".into()
                 } else {
-                    cfg.enabled_apps.iter().cloned().collect::<Vec<_>>().join(", ")
+                    cfg.enabled_apps
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             );
             println!(
@@ -268,7 +300,6 @@ fn main() -> Result<()> {
 fn run_setup() -> Result<()> {
     println!("=== pi-nap Setup ===");
 
-    // 1. Initialize config file (preserving any existing settings)
     let cfg = NapConfig::load();
     cfg.save()?;
     println!("[1/4] Config ready: {}", config_path().display());
@@ -277,7 +308,6 @@ fn run_setup() -> Result<()> {
         cfg.enabled_apps.len()
     );
 
-    // 2. Check window focus backend
     let (focused_pid, backend) = detect_focused_pid();
     if backend != "none" {
         println!(
@@ -304,11 +334,12 @@ fn run_setup() -> Result<()> {
         }
     }
 
-    // 3. Install systemd user unit
     let unit_path = install_systemd_user_service()?;
-    println!("[3/4] Installed systemd user service: {}", unit_path.display());
+    println!(
+        "[3/4] Installed systemd user service: {}",
+        unit_path.display()
+    );
 
-    // 4. Reload & enable+start via systemctl --user
     let reload = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
@@ -329,7 +360,7 @@ fn run_setup() -> Result<()> {
         }
     }
 
-    println!("\nAll set! Run `pi-nap` (or `pi-nap tui`) to pick which apps to freeze and adjust settings.");
+    println!("\nAll set! Run `pi-nap` (or `pi-nap tui`) to pick which apps/services to freeze and adjust settings.");
     Ok(())
 }
 
@@ -339,30 +370,135 @@ enum NapTab {
     Settings = 1,
 }
 
-fn build_app_list(cfg: &NapConfig, focused_pid: Option<i32>) -> Vec<RunningApp> {
-    let mut apps = list_running_apps(cfg, focused_pid);
-    let present: BTreeSet<String> = apps.iter().map(|a| a.name.to_lowercase()).collect();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    AppsFirst,
+    ServicesFirst,
+    RunningFirst,
+    EnabledFirst,
+    NameAsc,
+}
 
-    // Also include opted-in apps that aren't currently running so the user can toggle them off
-    for enabled_name in &cfg.enabled_apps {
-        if !present.contains(&enabled_name.to_lowercase()) {
-            apps.push(RunningApp {
-                name: enabled_name.clone(),
-                pids: Vec::new(),
-                any_stopped: false,
-                protected: false,
-                enabled: true,
-                focused: false,
-            });
+impl SortMode {
+    fn next(self) -> Self {
+        match self {
+            SortMode::AppsFirst => SortMode::ServicesFirst,
+            SortMode::ServicesFirst => SortMode::RunningFirst,
+            SortMode::RunningFirst => SortMode::EnabledFirst,
+            SortMode::EnabledFirst => SortMode::NameAsc,
+            SortMode::NameAsc => SortMode::AppsFirst,
         }
     }
 
-    apps.sort_by(|a, b| {
-        b.enabled
-            .cmp(&a.enabled)
-            .then_with(|| a.protected.cmp(&b.protected))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::AppsFirst => "Apps First",
+            SortMode::ServicesFirst => "Services First",
+            SortMode::RunningFirst => "Running First",
+            SortMode::EnabledFirst => "Enabled First",
+            SortMode::NameAsc => "Name (A-Z)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    All,
+    AppsOnly,
+    ServicesOnly,
+    RunningOnly,
+    EnabledOnly,
+}
+
+impl FilterMode {
+    fn next(self) -> Self {
+        match self {
+            FilterMode::All => FilterMode::AppsOnly,
+            FilterMode::AppsOnly => FilterMode::ServicesOnly,
+            FilterMode::ServicesOnly => FilterMode::RunningOnly,
+            FilterMode::RunningOnly => FilterMode::EnabledOnly,
+            FilterMode::EnabledOnly => FilterMode::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            FilterMode::All => "All",
+            FilterMode::AppsOnly => "Apps Only",
+            FilterMode::ServicesOnly => "Services Only",
+            FilterMode::RunningOnly => "Running Only",
+            FilterMode::EnabledOnly => "Enabled Only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    AddApp(String),
+    Search(String),
+}
+
+fn apply_filter_and_sort(
+    mut apps: Vec<RunningApp>,
+    filter: FilterMode,
+    sort: SortMode,
+    search: &str,
+) -> Vec<RunningApp> {
+    apps.retain(|a| match filter {
+        FilterMode::All => true,
+        FilterMode::AppsOnly => a.kind == AppKind::Application,
+        FilterMode::ServicesOnly => a.kind == AppKind::Service,
+        FilterMode::RunningOnly => !a.pids.is_empty(),
+        FilterMode::EnabledOnly => a.enabled,
     });
+
+    let q = search.trim().to_lowercase();
+    if !q.is_empty() {
+        apps.retain(|a| {
+            a.name.to_lowercase().contains(&q)
+                || a.display_name
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        });
+    }
+
+    match sort {
+        SortMode::AppsFirst => apps.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then_with(|| b.enabled.cmp(&a.enabled))
+                .then_with(|| a.protected.cmp(&b.protected))
+                .then_with(|| b.pids.is_empty().cmp(&a.pids.is_empty()).reverse())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        SortMode::ServicesFirst => apps.sort_by(|a, b| {
+            b.kind
+                .cmp(&a.kind)
+                .then_with(|| b.enabled.cmp(&a.enabled))
+                .then_with(|| a.protected.cmp(&b.protected))
+                .then_with(|| b.pids.is_empty().cmp(&a.pids.is_empty()).reverse())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        SortMode::RunningFirst => apps.sort_by(|a, b| {
+            a.pids
+                .is_empty()
+                .cmp(&b.pids.is_empty())
+                .then_with(|| b.enabled.cmp(&a.enabled))
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        SortMode::EnabledFirst => apps.sort_by(|a, b| {
+            b.enabled
+                .cmp(&a.enabled)
+                .then_with(|| a.protected.cmp(&b.protected))
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        SortMode::NameAsc => apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+    }
+
     apps
 }
 
@@ -386,19 +522,37 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
     let tick_rate = Duration::from_millis(800);
     let mut last_tick = Instant::now() - tick_rate;
 
+    // Scan installed desktop apps & user services once at startup (refreshable with 'R')
+    let mut installed_apps: HashMap<String, (String, String)> = discover_installed_apps();
+    let mut user_services: HashMap<String, (String, String)> = discover_user_services();
+
     let mut tab = NapTab::Apps;
     let mut cfg = NapConfig::load();
     let mut status = read_live_status();
-    let mut apps = build_app_list(&cfg, status.as_ref().and_then(|s| s.focused_pid));
+    let mut sort_mode = SortMode::AppsFirst;
+    let mut filter_mode = FilterMode::All;
+    let mut search_query = String::new();
+    let mut input_mode = InputMode::Normal;
+
+    let mut raw_apps = list_all_apps(
+        &cfg,
+        status.as_ref().and_then(|s| s.focused_pid),
+        &installed_apps,
+        &user_services,
+    );
     let mut app_selected: usize = 0;
     let mut setting_selected: usize = 0;
-    let mut add_input: Option<String> = None;
     let mut toast: Option<(String, Instant)> = None;
 
     loop {
         if last_tick.elapsed() >= tick_rate {
             status = read_live_status();
-            apps = build_app_list(&cfg, status.as_ref().and_then(|s| s.focused_pid));
+            raw_apps = list_all_apps(
+                &cfg,
+                status.as_ref().and_then(|s| s.focused_pid),
+                &installed_apps,
+                &user_services,
+            );
             last_tick = Instant::now();
         }
 
@@ -408,8 +562,15 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
             }
         }
 
-        if !apps.is_empty() && app_selected >= apps.len() {
-            app_selected = apps.len() - 1;
+        let active_search = match &input_mode {
+            InputMode::Search(s) => s.as_str(),
+            _ => search_query.as_str(),
+        };
+        let visible_apps =
+            apply_filter_and_sort(raw_apps.clone(), filter_mode, sort_mode, active_search);
+
+        if !visible_apps.is_empty() && app_selected >= visible_apps.len() {
+            app_selected = visible_apps.len() - 1;
         }
 
         terminal.draw(|f| {
@@ -418,10 +579,13 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                 tab,
                 &cfg,
                 status.as_ref(),
-                &apps,
+                &visible_apps,
                 app_selected,
                 setting_selected,
-                add_input.as_deref(),
+                sort_mode,
+                filter_mode,
+                &input_mode,
+                &search_query,
                 toast.as_ref().map(|(s, _)| s.as_str()),
             );
         })?;
@@ -437,48 +601,84 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                     return Ok(());
                 }
 
-                // Handle inline "add app by name" input modal
-                if let Some(buf) = add_input.as_mut() {
-                    match key.code {
-                        KeyCode::Esc => {
-                            add_input = None;
-                        }
-                        KeyCode::Enter => {
-                            let name = buf.trim().to_string();
-                            add_input = None;
-                            if !name.is_empty() {
-                                match cfg.set_enabled(&name, true) {
-                                    Ok(_) => {
-                                        toast = Some((
-                                            format!("Enabled App Nap for '{name}' (saved)"),
-                                            Instant::now(),
-                                        ));
-                                        apps = build_app_list(
-                                            &cfg,
-                                            status.as_ref().and_then(|s| s.focused_pid),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        toast = Some((format!("{e}"), Instant::now()));
+                // Handle inline text input modes (AddApp / Search)
+                match &mut input_mode {
+                    InputMode::AddApp(buf) => {
+                        match key.code {
+                            KeyCode::Esc => input_mode = InputMode::Normal,
+                            KeyCode::Enter => {
+                                let name = buf.trim().to_string();
+                                input_mode = InputMode::Normal;
+                                if !name.is_empty() {
+                                    match cfg.set_enabled(&name, true) {
+                                        Ok(_) => {
+                                            toast = Some((
+                                                format!("Enabled App Nap for '{name}' (saved)"),
+                                                Instant::now(),
+                                            ));
+                                            raw_apps = list_all_apps(
+                                                &cfg,
+                                                status.as_ref().and_then(|s| s.focused_pid),
+                                                &installed_apps,
+                                                &user_services,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            toast = Some((format!("{e}"), Instant::now()));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        KeyCode::Backspace => {
-                            buf.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            if buf.len() < 48 {
-                                buf.push(c);
+                            KeyCode::Backspace => {
+                                buf.pop();
                             }
+                            KeyCode::Char(c) => {
+                                if buf.len() < 48 {
+                                    buf.push(c);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                        continue;
                     }
-                    continue;
+                    InputMode::Search(buf) => {
+                        match key.code {
+                            KeyCode::Esc => {
+                                search_query.clear();
+                                input_mode = InputMode::Normal;
+                            }
+                            KeyCode::Enter => {
+                                search_query = buf.clone();
+                                input_mode = InputMode::Normal;
+                                app_selected = 0;
+                            }
+                            KeyCode::Backspace => {
+                                buf.pop();
+                                app_selected = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                if buf.len() < 48 {
+                                    buf.push(c);
+                                    app_selected = 0;
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    InputMode::Normal => {}
                 }
 
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Esc => {
+                        if !search_query.is_empty() {
+                            search_query.clear();
+                            app_selected = 0;
+                        } else {
+                            return Ok(());
+                        }
+                    }
                     KeyCode::Tab => {
                         tab = match tab {
                             NapTab::Apps => NapTab::Settings,
@@ -490,7 +690,7 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
 
                     // Apps tab
                     KeyCode::Down | KeyCode::Char('j') if tab == NapTab::Apps => {
-                        if app_selected + 1 < apps.len() {
+                        if app_selected + 1 < visible_apps.len() {
                             app_selected += 1;
                         }
                     }
@@ -498,7 +698,7 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                         app_selected = app_selected.saturating_sub(1);
                     }
                     KeyCode::Char(' ') | KeyCode::Enter if tab == NapTab::Apps => {
-                        if let Some(app) = apps.get(app_selected) {
+                        if let Some(app) = visible_apps.get(app_selected) {
                             let name = app.name.clone();
                             match cfg.toggle_app(&name) {
                                 Ok(true) => {
@@ -518,14 +718,47 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                                     toast = Some((format!("{e}"), Instant::now()));
                                 }
                             }
-                            apps = build_app_list(
+                            raw_apps = list_all_apps(
                                 &cfg,
                                 status.as_ref().and_then(|s| s.focused_pid),
+                                &installed_apps,
+                                &user_services,
                             );
                         }
                     }
+                    KeyCode::Char('s') if tab == NapTab::Apps => {
+                        sort_mode = sort_mode.next();
+                        app_selected = 0;
+                        toast = Some((format!("Sort: {}", sort_mode.label()), Instant::now()));
+                    }
+                    KeyCode::Char('f') if tab == NapTab::Apps => {
+                        filter_mode = filter_mode.next();
+                        app_selected = 0;
+                        toast = Some((format!("Filter: {}", filter_mode.label()), Instant::now()));
+                    }
+                    KeyCode::Char('/') if tab == NapTab::Apps => {
+                        input_mode = InputMode::Search(search_query.clone());
+                    }
                     KeyCode::Char('a') if tab == NapTab::Apps => {
-                        add_input = Some(String::new());
+                        input_mode = InputMode::AddApp(String::new());
+                    }
+                    KeyCode::Char('R') if tab == NapTab::Apps => {
+                        installed_apps = discover_installed_apps();
+                        user_services = discover_user_services();
+                        raw_apps = list_all_apps(
+                            &cfg,
+                            status.as_ref().and_then(|s| s.focused_pid),
+                            &installed_apps,
+                            &user_services,
+                        );
+                        toast = Some((
+                            format!(
+                                "Rescanned {} installed apps & {} user services.",
+                                installed_apps.len(),
+                                user_services.len()
+                            ),
+                            Instant::now(),
+                        ));
                     }
                     KeyCode::Char('u') => {
                         let n = thaw_user_apps(None);
@@ -549,7 +782,10 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                         if let Err(e) = cfg.save() {
                             toast = Some((format!("Save failed: {e}"), Instant::now()));
                         } else {
-                            toast = Some(("Saved settings (daemon hot-reloads automatically).".into(), Instant::now()));
+                            toast = Some((
+                                "Saved settings (daemon hot-reloads automatically).".into(),
+                                Instant::now(),
+                            ));
                         }
                     }
                     KeyCode::Left | KeyCode::Char('-') if tab == NapTab::Settings => {
@@ -557,7 +793,10 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
                         if let Err(e) = cfg.save() {
                             toast = Some((format!("Save failed: {e}"), Instant::now()));
                         } else {
-                            toast = Some(("Saved settings (daemon hot-reloads automatically).".into(), Instant::now()));
+                            toast = Some((
+                                "Saved settings (daemon hot-reloads automatically).".into(),
+                                Instant::now(),
+                            ));
                         }
                     }
                     KeyCode::Char('r') if tab == NapTab::Settings => {
@@ -577,7 +816,6 @@ fn run_tui_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result
 fn adjust_setting(cfg: &mut NapConfig, idx: usize, inc: bool) {
     match idx {
         0 => {
-            // grace_secs (1..=600, step 5s or 1s near bottom)
             if inc {
                 cfg.grace_secs = if cfg.grace_secs < 5 {
                     cfg.grace_secs + 1
@@ -593,7 +831,6 @@ fn adjust_setting(cfg: &mut NapConfig, idx: usize, inc: bool) {
             }
         }
         1 => {
-            // pulse_interval_secs (0..=600, step 5s)
             if inc {
                 cfg.pulse_interval_secs = (cfg.pulse_interval_secs + 5).min(600);
             } else {
@@ -601,7 +838,6 @@ fn adjust_setting(cfg: &mut NapConfig, idx: usize, inc: bool) {
             }
         }
         2 => {
-            // pulse_duration_ms (50..=2000, step 50ms)
             if inc {
                 cfg.pulse_duration_ms = (cfg.pulse_duration_ms + 50).min(2000);
             } else {
@@ -609,7 +845,6 @@ fn adjust_setting(cfg: &mut NapConfig, idx: usize, inc: bool) {
             }
         }
         3 => {
-            // poll_interval_ms (250..=5000, step 250ms)
             if inc {
                 cfg.poll_interval_ms = (cfg.poll_interval_ms + 250).min(5000);
             } else {
@@ -629,7 +864,10 @@ fn draw_nap_tui(
     apps: &[RunningApp],
     app_selected: usize,
     setting_selected: usize,
-    add_input: Option<&str>,
+    sort_mode: SortMode,
+    filter_mode: FilterMode,
+    input_mode: &InputMode,
+    search_query: &str,
     toast: Option<&str>,
 ) {
     let chunks = Layout::default()
@@ -688,7 +926,10 @@ fn draw_nap_tui(
     f.render_widget(header, chunks[0]);
 
     let titles = vec![
-        Line::from(Span::styled("1: Apps", Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            "1: Apps & Services",
+            Style::default().fg(Color::White),
+        )),
         Line::from(Span::styled(
             "2: Settings",
             Style::default().fg(Color::White),
@@ -709,7 +950,16 @@ fn draw_nap_tui(
     f.render_widget(tabs, chunks[1]);
 
     match tab {
-        NapTab::Apps => draw_apps_tab(f, chunks[2], apps, app_selected, add_input),
+        NapTab::Apps => draw_apps_tab(
+            f,
+            chunks[2],
+            apps,
+            app_selected,
+            sort_mode,
+            filter_mode,
+            input_mode,
+            search_query,
+        ),
         NapTab::Settings => draw_settings_tab(f, chunks[2], cfg, setting_selected),
     }
 
@@ -720,34 +970,44 @@ fn draw_nap_tui(
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ))
-    } else if add_input.is_some() {
-        Line::from(Span::styled(
-            " Type app name (e.g. chromium) and press Enter to enable | Esc to cancel",
-            Style::default().fg(Color::Yellow),
-        ))
     } else {
-        match tab {
-            NapTab::Apps => Line::from(Span::styled(
-                " [↑/↓] Select  [Space/Enter] Toggle Freeze  [a] Add App Name  [u] Thaw All  [Tab/2] Settings  [q] Quit",
-                Style::default().fg(Color::DarkGray),
+        match input_mode {
+            InputMode::AddApp(_) => Line::from(Span::styled(
+                " Type app/service name (e.g. chromium) and press Enter to enable | Esc to cancel",
+                Style::default().fg(Color::Yellow),
             )),
-            NapTab::Settings => Line::from(Span::styled(
-                " [↑/↓] Select Setting  [←/→ or -/+] Change Value  [r] Reset Defaults  [Tab/1] Apps  [q] Quit",
-                Style::default().fg(Color::DarkGray),
+            InputMode::Search(_) => Line::from(Span::styled(
+                " Type to search apps & services | Enter to apply | Esc to clear",
+                Style::default().fg(Color::Yellow),
             )),
+            InputMode::Normal => match tab {
+                NapTab::Apps => Line::from(Span::styled(
+                    " [Space/Enter] Toggle  [s] Sort (Apps/Services)  [f] Filter  [/] Search  [a] Add  [u] Thaw  [Tab] Settings  [q] Quit",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                NapTab::Settings => Line::from(Span::styled(
+                    " [↑/↓] Select  [←/→ or -/+] Change Value  [r] Reset Defaults  [Tab/1] Apps  [q] Quit",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            },
         }
     };
     f.render_widget(Paragraph::new(footer_text), chunks[3]);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_apps_tab(
     f: &mut Frame,
     area: Rect,
     apps: &[RunningApp],
     selected: usize,
-    add_input: Option<&str>,
+    sort_mode: SortMode,
+    filter_mode: FilterMode,
+    input_mode: &InputMode,
+    search_query: &str,
 ) {
-    let chunks = if add_input.is_some() {
+    let has_prompt = !matches!(input_mode, InputMode::Normal);
+    let chunks = if has_prompt {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(6), Constraint::Length(3)])
@@ -759,8 +1019,15 @@ fn draw_apps_tab(
             .split(area)
     };
 
-    let header = Row::new(vec!["", "APP NAME", "NAP STATUS", "PIDS", "LIVE STATE"])
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "",
+        "NAME",
+        "TYPE",
+        "NAP STATUS",
+        "PIDS",
+        "LIVE STATE",
+    ])
+    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
     let max_rows = chunks[0].height.saturating_sub(3) as usize;
     let scroll = if selected >= max_rows && max_rows > 0 {
@@ -789,8 +1056,13 @@ fn draw_apps_tab(
                 ("[off]", Style::default().fg(Color::Gray))
             };
 
+            let type_style = match app.kind {
+                AppKind::Application => Style::default().fg(Color::Cyan),
+                AppKind::Service => Style::default().fg(Color::Yellow),
+            };
+
             let live = if app.pids.is_empty() {
-                Span::styled("(not running)", Style::default().fg(Color::DarkGray))
+                Span::styled("installed", Style::default().fg(Color::DarkGray))
             } else if app.any_stopped {
                 Span::styled(
                     "❄ FROZEN",
@@ -801,7 +1073,12 @@ fn draw_apps_tab(
             } else if app.focused {
                 Span::styled("● FOCUSED", Style::default().fg(Color::Cyan))
             } else {
-                Span::styled("active", Style::default().fg(Color::DarkGray))
+                Span::styled("running", Style::default().fg(Color::Green))
+            };
+
+            let display_col = match &app.display_name {
+                Some(d) if !d.eq_ignore_ascii_case(&app.name) => format!("{} ({})", app.name, d),
+                _ => app.name.clone(),
             };
 
             let row_style = if is_sel {
@@ -815,7 +1092,8 @@ fn draw_apps_tab(
 
             Row::new(vec![
                 Cell::from(if is_sel { "▶" } else { " " }),
-                Cell::from(app.name.clone()),
+                Cell::from(display_col),
+                Cell::from(app.kind.label()).style(type_style),
                 Cell::from(opt_text).style(opt_style),
                 Cell::from(app.pids.len().to_string()),
                 Cell::from(Line::from(live)),
@@ -824,35 +1102,70 @@ fn draw_apps_tab(
         })
         .collect();
 
+    let search_badge = if !search_query.is_empty() {
+        format!(" | Search: \"{search_query}\" (Esc clears)")
+    } else {
+        String::new()
+    };
+
     let table = Table::new(
         rows,
         [
             Constraint::Length(2),
-            Constraint::Min(24),
-            Constraint::Length(16),
-            Constraint::Length(8),
-            Constraint::Length(16),
+            Constraint::Min(28),
+            Constraint::Length(9),
+            Constraint::Length(15),
+            Constraint::Length(6),
+            Constraint::Length(12),
         ],
     )
     .header(header)
     .block(
         Block::default()
-            .title(" Select Apps to Freeze When Unfocused (Terminals & system apps are always PROTECTED) ")
+            .title(format!(
+                " {} items | Sort: {} [s] | Filter: {} [f]{} ",
+                apps.len(),
+                sort_mode.label(),
+                filter_mode.label(),
+                search_badge
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(table, chunks[0]);
 
-    if let Some(buf) = add_input {
-        let prompt = Paragraph::new(format!(" App name to enable: {buf}█"))
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-            .block(
-                Block::default()
-                    .title(" Add App Manually (even if not running yet) ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
-        f.render_widget(prompt, chunks[1]);
+    match input_mode {
+        InputMode::AddApp(buf) => {
+            let prompt = Paragraph::new(format!(" App/service name to enable: {buf}█"))
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(
+                    Block::default()
+                        .title(" Add App Manually ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                );
+            f.render_widget(prompt, chunks[1]);
+        }
+        InputMode::Search(buf) => {
+            let prompt = Paragraph::new(format!(" Search: {buf}█"))
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(
+                    Block::default()
+                        .title(" Filter by Name ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+            f.render_widget(prompt, chunks[1]);
+        }
+        InputMode::Normal => {}
     }
 }
 

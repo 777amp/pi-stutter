@@ -165,9 +165,26 @@ pub struct NapLiveStatus {
     pub total_frozen_pids: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AppKind {
+    Application,
+    Service,
+}
+
+impl AppKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AppKind::Application => "App",
+            AppKind::Service => "Service",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunningApp {
     pub name: String,
+    pub display_name: Option<String>,
+    pub kind: AppKind,
     pub pids: Vec<i32>,
     pub any_stopped: bool,
     pub protected: bool,
@@ -334,8 +351,178 @@ fn write_live_status(st: &NapLiveStatus) {
     }
 }
 
-/// Lists user-owned running applications grouped by canonical name.
+/// Discovers installed GUI applications from standard XDG `.desktop` directories.
+/// Returns map of `lowercase_exec_name -> (exec_name, friendly_display_name)`.
+pub fn discover_installed_apps() -> HashMap<String, (String, String)> {
+    let mut found: HashMap<String, (String, String)> = HashMap::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let mut dirs = vec![
+        PathBuf::from("/usr/share/applications"),
+        PathBuf::from("/usr/local/share/applications"),
+        PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+        PathBuf::from("/var/lib/snapd/desktop/applications"),
+    ];
+    if !home.is_empty() {
+        dirs.push(PathBuf::from(&home).join(".local/share/applications"));
+    }
+
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            if let Some((exec_name, display_name)) = parse_desktop_file(&path) {
+                let key = exec_name.to_lowercase();
+                found.entry(key).or_insert((exec_name, display_name));
+            }
+        }
+    }
+    found
+}
+
+fn parse_desktop_file(path: &Path) -> Option<(String, String)> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut in_main = false;
+    let mut app_type: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut exec_line: Option<String> = None;
+    let mut no_display = false;
+    let mut hidden = false;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_main = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_main {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "Type" => app_type = Some(v.trim().to_string()),
+                "Name" if name.is_none() => name = Some(v.trim().to_string()),
+                "Exec" if exec_line.is_none() => exec_line = Some(v.trim().to_string()),
+                "NoDisplay" => no_display = v.trim().eq_ignore_ascii_case("true"),
+                "Hidden" => hidden = v.trim().eq_ignore_ascii_case("true"),
+                _ => {}
+            }
+        }
+    }
+
+    if no_display || hidden {
+        return None;
+    }
+    if app_type.as_deref() != Some("Application") {
+        return None;
+    }
+
+    let exec_raw = exec_line?;
+    let exec_name = extract_exec_binary(&exec_raw)?;
+    let display = name.unwrap_or_else(|| exec_name.clone());
+    Some((exec_name, display))
+}
+
+fn extract_exec_binary(exec_line: &str) -> Option<String> {
+    let mut tokens = exec_line.split_whitespace().peekable();
+    while let Some(&tok) = tokens.peek() {
+        let cleaned = tok.trim_matches('"').trim_matches('\'');
+        // Skip `env` prefix and `KEY=VALUE` assignments
+        if cleaned == "env" || cleaned.contains('=') {
+            tokens.next();
+            continue;
+        }
+        // Skip flatpak / snap / wrapper launchers to get the actual app token if possible
+        if cleaned == "sh" || cleaned == "bash" || cleaned == "/bin/sh" || cleaned == "/bin/bash" {
+            return None;
+        }
+        let norm = normalize_app_name(cleaned);
+        if norm.is_empty() || norm.starts_with('%') {
+            return None;
+        }
+        return Some(norm);
+    }
+    None
+}
+
+/// Discovers installed user systemd services (`~/.config/systemd/user/*.service`).
+/// Returns map of `lowercase_exec_name -> (exec_name, unit_display_name)`.
+pub fn discover_user_services() -> HashMap<String, (String, String)> {
+    let mut found: HashMap<String, (String, String)> = HashMap::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let mut dirs = vec![PathBuf::from("/etc/systemd/user")];
+    if !home.is_empty() {
+        dirs.push(PathBuf::from(&home).join(".config/systemd/user"));
+    }
+
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("service") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let unit_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            for line in content.lines() {
+                let l = line.trim();
+                if let Some(rest) = l.strip_prefix("ExecStart=") {
+                    let rest = rest.trim_start_matches(['-', '@', '+', '!', ':']);
+                    if let Some(exec_name) = extract_exec_binary(rest) {
+                        let key = exec_name.to_lowercase();
+                        found
+                            .entry(key)
+                            .or_insert((exec_name, format!("{unit_name}.service")));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Lists user-owned running applications & services grouped by canonical name.
 pub fn list_running_apps(cfg: &NapConfig, focused_pid: Option<i32>) -> Vec<RunningApp> {
+    let installed_apps = discover_installed_apps();
+    list_apps_internal(cfg, focused_pid, &installed_apps, &HashMap::new(), false)
+}
+
+/// Lists ALL applications & services: running processes + installed `.desktop` GUI apps +
+/// installed user systemd services + any opted-in apps from config.
+pub fn list_all_apps(
+    cfg: &NapConfig,
+    focused_pid: Option<i32>,
+    installed_apps: &HashMap<String, (String, String)>,
+    user_services: &HashMap<String, (String, String)>,
+) -> Vec<RunningApp> {
+    list_apps_internal(cfg, focused_pid, installed_apps, user_services, true)
+}
+
+fn list_apps_internal(
+    cfg: &NapConfig,
+    focused_pid: Option<i32>,
+    installed_apps: &HashMap<String, (String, String)>,
+    user_services: &HashMap<String, (String, String)>,
+    include_installed: bool,
+) -> Vec<RunningApp> {
     let uid = current_uid();
     let procs = scan_processes();
     let focused_chain = focused_pid
@@ -354,16 +541,33 @@ pub fn list_running_apps(cfg: &NapConfig, focused_pid: Option<i32>) -> Vec<Runni
         groups.entry(name).or_default().push(p);
     }
 
+    let mut seen_lower: HashSet<String> = HashSet::new();
     let mut apps: Vec<RunningApp> = groups
         .into_iter()
         .map(|(name, list)| {
+            let key = name.to_lowercase();
+            seen_lower.insert(key.clone());
+
             let pids: Vec<i32> = list.iter().map(|p| p.pid).collect();
             let any_stopped = list.iter().any(|p| p.state == 'T' || p.state == 't');
             let focused = list.iter().any(|p| focused_chain.contains(&p.pid));
             let protected = is_protected_app(&name);
             let enabled = !protected && cfg.is_enabled(&name);
+
+            let (kind, display_name) = if let Some((_, disp)) = installed_apps.get(&key) {
+                (AppKind::Application, Some(disp.clone()))
+            } else if focused {
+                (AppKind::Application, None)
+            } else if let Some((_, svc_disp)) = user_services.get(&key) {
+                (AppKind::Service, Some(svc_disp.clone()))
+            } else {
+                (AppKind::Service, None)
+            };
+
             RunningApp {
                 name,
+                display_name,
+                kind,
                 pids,
                 any_stopped,
                 protected,
@@ -373,7 +577,68 @@ pub fn list_running_apps(cfg: &NapConfig, focused_pid: Option<i32>) -> Vec<Runni
         })
         .collect();
 
-    // Sort: enabled first, then non-protected, then alphabetical
+    if include_installed {
+        // Add installed desktop GUI apps that aren't currently running
+        for (key, (exec_name, disp)) in installed_apps {
+            if seen_lower.contains(key) {
+                continue;
+            }
+            seen_lower.insert(key.clone());
+            let protected = is_protected_app(exec_name);
+            let enabled = !protected && cfg.is_enabled(exec_name);
+            apps.push(RunningApp {
+                name: exec_name.clone(),
+                display_name: Some(disp.clone()),
+                kind: AppKind::Application,
+                pids: Vec::new(),
+                any_stopped: false,
+                protected,
+                enabled,
+                focused: false,
+            });
+        }
+
+        // Add installed user systemd services that aren't currently running
+        for (key, (exec_name, svc_disp)) in user_services {
+            if seen_lower.contains(key) {
+                continue;
+            }
+            seen_lower.insert(key.clone());
+            let protected = is_protected_app(exec_name);
+            let enabled = !protected && cfg.is_enabled(exec_name);
+            apps.push(RunningApp {
+                name: exec_name.clone(),
+                display_name: Some(svc_disp.clone()),
+                kind: AppKind::Service,
+                pids: Vec::new(),
+                any_stopped: false,
+                protected,
+                enabled,
+                focused: false,
+            });
+        }
+
+        // Add any manually opted-in apps/services from config that weren't found above
+        for enabled_name in &cfg.enabled_apps {
+            let key = enabled_name.to_lowercase();
+            if seen_lower.contains(&key) {
+                continue;
+            }
+            seen_lower.insert(key);
+            apps.push(RunningApp {
+                name: enabled_name.clone(),
+                display_name: None,
+                kind: AppKind::Service,
+                pids: Vec::new(),
+                any_stopped: false,
+                protected: false,
+                enabled: true,
+                focused: false,
+            });
+        }
+    }
+
+    // Default sort: enabled first, then non-protected, then alphabetical
     apps.sort_by(|a, b| {
         b.enabled
             .cmp(&a.enabled)
