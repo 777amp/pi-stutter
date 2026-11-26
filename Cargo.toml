@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "pi-nap"
 path = "src/bin/pi_nap.rs"
 
+[[bin]]
+name = "pi-attach"
+path = "src/bin/pi_attach.rs"
+
 [dependencies]
 anyhow = "1.0"
 chrono = "0.4"

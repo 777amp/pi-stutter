@@ -1,0 +1,38 @@
+name: Release aarch64 Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Publish GitHub Release with aarch64 binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            bin/pi-stutter-aarch64-unknown-linux-gnu \
+            bin/pi-nap-aarch64-unknown-linux-gnu \
+            bin/pi-attach-aarch64-unknown-linux-gnu \
+            --title "$TAG — Raspberry Pi (aarch64) Release" \
+            --notes "Prebuilt **aarch64** (Raspberry Pi 64-bit) binaries for all 3 tools:
+          - \`pi-stutter\` — TUI system & stutter profiler
+          - \`pi-nap\` — macOS App Nap-style opt-in background app freezer
+          - \`pi-attach\` — Standalone deep process/thread lag debugger"
